@@ -144,8 +144,8 @@ corrplot::corrplot(cor_matrix, tl.col = "black", method = "square",  col = corrp
 ### Monocle2 ------------
 library(monocle)
 
-count.mat <- as.matrix(seurat_obj@assays$RNA@counts)
-pd <- new('AnnotatedDataFrame', data = seurat_obj@meta.data)
+count.mat <- as.matrix(seurat.obj@assays$RNA@counts)
+pd <- new('AnnotatedDataFrame', data = seurat.obj@meta.data)
 genes.df <- data.frame(apply(X = count.mat, 1, FUN = function(x) { sum(x > 0)} ))
 fd <- new('AnnotatedDataFrame', data = data.frame(gene_short_name = row.names(gene.df), row.names = row.names(gene.df), num_cells_expressed = gene.df[,1]))
 cds <- newCellDataSet(count.mat, phenoData = pd, featureData = fd, expressionFamily = negbinomial.size())
@@ -160,3 +160,22 @@ cds <- setOrderingFilter(cds, ordering_genes)
 cds <- reduceDimension(cds = cds, method = 'DDRTree')
 cds <- orderCells(cds)
 plot_cell_trajectory(cds, color_by = "subset")
+
+### Xenium label transfer ------------
+library(spacexr)
+
+counts <- seurat.obj[["RNA"]]$counts
+cell_types <- seurat.obj$annot_level2; names(cell_types) <- seurat.obj$barcode 
+cell_types <- as.factor(cell_types) # convert to factor data type
+nUMI <- seurat.obj$nCount_RNA; names(nUMI) <- seurat.obj$barcode 
+reference <- Reference(counts, cell_types, nUMI, n_max_cells=80000)
+
+query.counts <- GetAssayData(xenium.obj, assay = "Xenium", slot = "counts")
+coords <- GetTissueCoordinates(xenium.obj, which = "centroids")
+    
+xenium.obj[["X"]] <- coords[,1]; xenium.obj[["Y"]] <- coords[,2]
+coords <- xenium.obj@meta.data[, c("X", "Y")]
+query <- SpatialRNA(coords, query.counts, colSums(query.counts))
+    
+myRCTD <- create.RCTD(query, reference, UMI_min=0, UMI_min_sigma=1, counts_MIN=0, max_cores = 4)
+myRCTD <- run.RCTD(myRCTD, doublet_mode = 'doublet')
