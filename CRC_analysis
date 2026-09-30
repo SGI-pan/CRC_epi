@@ -1,0 +1,162 @@
+set.seed(42)
+library(dplyr)
+library(ggplot2)
+library(stringr)
+library(Seurat)
+
+### Run Seurat ------------
+seurat.obj <- NormalizeData(object = seurat.obj, normalization.method = "LogNormalize", scale.factor = 10000)
+seurat.obj <- FindVariableFeatures(object = seurat.obj, selection.method = "vst")
+seurat.obj <- CellCycleScoring(seurat.obj, s.features = cc.genes$s.genes, g2m.features = cc.genes$g2m.genes, set.ident = T)
+seurat.obj <- ScaleData(object = seurat.obj, features = VariableFeatures(seurat.obj), vars.to.regress = c("nCount_RNA", "percent.mt", "S.Score", "G2M.Score"))
+
+var_regex <- '^MT-|^RPL|^RPS|^TRA|^TRB' 
+hvg <- grep(var_regex, VariableFeatures(seurat.obj), invert = T, value = T)
+seurat.obj <- RunPCA(seurat.obj, features=hvg)
+seurat.obj <- RunHarmony(seurat.obj, c( "Dataset", "orig.ident"))
+seurat.obj <- ElbowPlot(object = seurat.obj, n=50)
+
+seurat.obj <- RunUMAP(object = seurat.obj, reduction = "harmony", dims = 1:17)
+seurat.obj <- FindNeighbors(object = seurat.obj, reduction = "harmony", dims = 1:17)
+seurat.obj <- FindClusters(object = seurat.obj, resolution = 0.6)
+
+seurat.degs <- FindAllMarkers(object = seurat.obj)
+
+###	Modular score calculation ------------
+epi.obj <- AddModuleScore(object = epi.obj, features = signature.list, name = names(signature.list))
+
+### Cell-cell communications ------------
+library(nichenetr)
+
+lr_network <- readRDS(url("https://zenodo.org/record/7074291/files/lr_network_human_21122021.rds"))
+ligand_target_matrix <- readRDS(url("https://zenodo.org/record/7074291/files/ligand_target_matrix_nsga2r_final.rds"))
+weighted_networks <- readRDS(url("https://zenodo.org/record/7074291/files/weighted_networks_nsga2r_final.rds"))
+
+receiver = "SPP1 Macrophage"
+Idents(seurat.obj) <- seurat.obj$annot_level2
+
+expressed_genes_receiver <- get_expressed_genes(receiver, seurat.obj, pct = 0.1)
+all_receptors <- unique(lr_network$to)  
+expressed_receptors <- intersect(all_receptors, expressed_genes_receiver)
+potential_ligands <- lr_network %>% filter(to %in% expressed_receptors) %>% pull(from) %>% unique()
+
+sender_celltypes <- c("C3")
+list_expressed_genes_sender <- sender_celltypes %>% unique() %>% lapply(get_expressed_genes, seurat.obj, 0.2)
+expressed_genes_sender <- list_expressed_genes_sender %>% unlist() %>% unique()
+potential_ligands_focused <- intersect(potential_ligands, expressed_genes_sender) 
+
+
+DE_table_receiver <-  FindMarkers(object = Mye.obj, ident.1 = "SPP1 Macrophage", group.by = "annot_level2", min.pct = 0.1) %>% rownames_to_column("gene")
+geneset_oi <- DE_table_receiver %>% filter(p_val_adj <= 0.05 & abs(avg_log2FC) >= 0.25) %>% pull(gene)
+geneset_oi <- geneset_oi %>% .[. %in% rownames(ligand_target_matrix)]
+background_expressed_genes <- expressed_genes_receiver %>% .[. %in% rownames(ligand_target_matrix)]
+
+
+ligand_activities <- predict_ligand_activities(geneset = geneset_oi,
+                                               background_expressed_genes = background_expressed_genes,
+                                               ligand_target_matrix = ligand_target_matrix,
+                                               potential_ligands = potential_ligands)
+ligand_activities <- ligand_activities %>% arrange(-pearson) %>% mutate(rank = rank(dplyr::desc(pearson)))
+
+ligand_activities <- ligand_activities %>% filter(test_ligand %in% potential_ligands_focused)
+best_upstream_ligands <- ligand_activities %>% top_n(10, pearson) %>% arrange(-pearson) %>%
+  pull(test_ligand) %>% unique()
+
+ligand_aupr_matrix <- ligand_activities %>% filter(test_ligand %in% best_upstream_ligands) %>%
+  column_to_rownames("test_ligand") %>% dplyr::select(pearson) %>% arrange(pearson)
+vis_ligand_aupr <- as.matrix(ligand_aupr_matrix, ncol = 1) 
+
+p_ligand_aupr <- make_heatmap_ggplot(vis_ligand_aupr,
+                                     "Prioritized ligands", "Ligand activity", 
+                                     legend_title = "Pearson", color = "darkorange") + 
+  theme(axis.text.x.top = element_blank())
+
+
+active_ligand_target_links_df <- best_upstream_ligands %>%
+  lapply(get_weighted_ligand_target_links,
+         geneset = geneset_oi,
+         ligand_target_matrix = ligand_target_matrix,
+         n = 30) %>%
+  bind_rows() %>% drop_na()
+
+active_ligand_target_links <- prepare_ligand_target_visualization(
+  ligand_target_df = active_ligand_target_links_df,
+  ligand_target_matrix = ligand_target_matrix,
+  cutoff = 0.5) 
+
+order_ligands <- intersect(best_upstream_ligands, colnames(active_ligand_target_links)) %>% rev()
+order_targets <- active_ligand_target_links_df$target %>% unique() %>% intersect(rownames(active_ligand_target_links))
+
+vis_ligand_target <- t(active_ligand_target_links[order_targets,order_ligands])
+
+ligand_receptor_links_df <- get_weighted_ligand_receptor_links(
+  best_upstream_ligands, expressed_receptors,
+  lr_network, weighted_networks$lr_sig) 
+
+vis_ligand_receptor_network <- prepare_ligand_receptor_visualization(
+  ligand_receptor_links_df,
+  best_upstream_ligands,
+  order_hclust = "receptors") 
+
+p_ligand_receptor <- make_heatmap_ggplot(t(vis_ligand_receptor_network), 
+                                         y_name = "Ligands", x_name = "Receptors",  
+                                         color = "mediumvioletred", legend_title = "Prior interaction potential")
+
+
+a <- AverageExpression(subset(seurat.obj, annot_level2 %in% paste0("C",c(seq(1,6),8))),features = best_upstream_ligands)
+b <- apply(as.matrix(a$RNA),1,scales::rescale, to=c(-1,1))
+d <- make_heatmap_ggplot(t(b[sort(rownames(b)),rev(colnames(b))]), 
+                    y_name = " ", x_name = " ",  
+                    color = "darkblue", legend_title = "Average Expression")
+
+###	Correlation ------------
+library(ggcorrplot)
+
+proportions <- seurat.obj@meta.data %>% 
+  group_by(orig.ident, annot_level1, annot_level2) %>%
+  summarise(count = n(), .groups = 'drop') %>%
+  group_by(orig.ident, annot_level1) %>%
+  mutate(total = sum(count),
+         proportion = count / total) %>%
+  ungroup()
+
+prop_wide <- proportions %>%
+  dplyr::select(orig.ident, annot_level2, proportion) %>%
+  pivot_wider(names_from = annot_level2, 
+              values_from = proportion,
+              values_fill = 0)
+
+cor_matrix <- round(cor(prop_wide %>% dplyr::select(-orig.ident), method = "pearson"),2)
+cor_matrix_p_val <- cor_pmat(prop_wide %>% dplyr::select(-orig.ident), method="pearson")
+
+cor_matrix_p_val_adj <- matrix(
+  p.adjust(cor_matrix_p_val, method = "fdr"),
+  nrow = nrow(cor_matrix_p_val),
+  ncol = ncol(cor_matrix_p_val),
+  dimnames = dimnames(cor_matrix_p_val)
+)
+cor_matrix_p_val_adj <- round(cor_matrix_p_val_adj, 2)
+
+corrplot::corrplot(cor_matrix, tl.col = "black", method = "square",  col = corrplot::COL2('PiYG'),
+                   p.mat = cor_matrix_p_val_adj, insig='label_sig',tl.offset = 0.4,tl.srt = 45, type = "upper",
+                   sig.level = c(0.01, 0.05, 0.1), pch.cex = 0.9) 
+
+### Monocle2 ------------
+library(monocle)
+
+count.mat <- as.matrix(seurat_obj@assays$RNA@counts)
+pd <- new('AnnotatedDataFrame', data = seurat_obj@meta.data)
+genes.df <- data.frame(apply(X = count.mat, 1, FUN = function(x) { sum(x > 0)} ))
+fd <- new('AnnotatedDataFrame', data = data.frame(gene_short_name = row.names(gene.df), row.names = row.names(gene.df), num_cells_expressed = gene.df[,1]))
+cds <- newCellDataSet(count.mat, phenoData = pd, featureData = fd, expressionFamily = negbinomial.size())
+
+cds <- estimateSizeFactors(cds)
+cds <- estimateDispersions(cds)
+
+set.seed(42)
+cds <- detectGenes(cds, min_expr = 0.1)
+cds <- cds[row.names(subset(fData(cds), num_cells_expressed >= 20)),]
+cds <- setOrderingFilter(cds, ordering_genes)
+cds <- reduceDimension(cds = cds, method = 'DDRTree')
+cds <- orderCells(cds)
+plot_cell_trajectory(cds, color_by = "subset")
